@@ -27,11 +27,43 @@ Seller                        Buyer
   |                          <-- metadata revealed
   |                        /buy <id>
   |                          --> pay $5 USDC via x402
-  |                          --> AI verifies claim
+  |                          --> USDC lands in BitGo MPC escrow wallet
+  |                          --> HeyElsa AI verifies claim on-chain
+  |                          --> AI passes? BitGo releases $5 to seller
   |  <-- "$5 USDC released"     |
+  |                          --> AI fails? BitGo refunds $5 to buyer
   |                        /decrypt <id>
   |                          <-- secret content + Fileverse link
 ```
+
+## BitGo MPC Escrow
+
+BitGo's MPC (Multi-Party Computation) wallet acts as a trustless escrow. No smart contract needed — it looks like normal wallet-to-wallet transfers on-chain.
+
+```
+Buyer pays via x402
+    |
+    v
+USDC lands in BitGo MPC wallet (SERVER_WALLET = BitGo treasury address)
+    |
+    v
+HeyElsa AI verifies the secret's claims on-chain
+    |
+    +-- LEGIT / PARTIALLY_VERIFIED / UNVERIFIABLE
+    |     --> BitGo releases USDC to seller's address
+    |     --> escrowService.releaseToSeller() → bitgoService.sendTransaction()
+    |     --> BitGo MPC signing: 🧩 Server key + 🧩 BitGo key = one signature
+    |
+    +-- FAKE / MISLEADING
+          --> BitGo refunds USDC to buyer
+          --> escrowService.refundToBuyer() → bitgoService.sendTransaction()
+```
+
+**How BitGo MPC works:**
+- Your server holds one key piece, BitGo holds another
+- Neither party can move funds alone — both must agree
+- On-chain it's a single normal transaction (no multisig contract)
+- Wallet created on Hoodi testnet (hteth) via BitGo SDK
 
 ## Architecture
 
@@ -121,8 +153,8 @@ npm install
 3. Copy the token into `TELEGRAM_BOT_TOKEN` in `.env`
 
 #### x402 / Server Wallet
-1. Any EVM wallet address that receives USDC payments
-2. Set `SERVER_WALLET` in `.env`
+1. `SERVER_WALLET` = your BitGo treasury address (buyer's USDC goes here as escrow)
+2. Set `SERVER_WALLET` in `.env` (same as `BITGO_TREASURY_ADDRESS`)
 3. The x402 facilitator is free (no signup): `https://x402.org/facilitator`
 
 #### HeyElsa (AI Verification)
@@ -130,10 +162,22 @@ npm install
 2. Fund with test USDC at [faucet.circle.com](https://faucet.circle.com) (Base Sepolia)
 3. Set `ELSA_PAYMENT_PRIVATE_KEY` in `.env`
 
-#### BitGo (Escrow)
-1. Sign up at [app.bitgo-test.com](https://app.bitgo-test.com)
+#### BitGo MPC (Escrow Wallet)
+1. Sign up at [app.bitgo-test.com](https://app.bitgo-test.com) (testnet)
 2. Settings -> Developer -> Access Tokens -> Create with "Spending" permission
 3. Set `BITGO_ACCESS_TOKEN` in `.env`
+4. Your Enterprise ID is on the same settings page -> set `BITGO_ENTERPRISE_ID`
+5. Create a treasury wallet (first time only):
+   ```bash
+   # Start the server first, then:
+   curl -X POST http://localhost:3001/wallet/create \
+     -H "Content-Type: application/json" \
+     -d '{"label": "PayPerSecret Escrow"}'
+   ```
+6. Copy the returned `walletId` -> set `BITGO_WALLET_ID` in `.env`
+7. Copy the receive address -> set `BITGO_TREASURY_ADDRESS` and `SERVER_WALLET` in `.env`
+8. Set `BITGO_WALLET_PASSPHRASE` (the passphrase you chose during wallet creation)
+9. Optionally start BitGo Express for local signing: `npx bitgo-express --port 3080 --env test`
 
 ### 3. Configure `.env`
 
@@ -149,10 +193,15 @@ Key variables:
 | `FILEVERSE_API_KEY` | Fileverse API key from ddocs.new |
 | `FILEVERSE_API_URL` | `http://localhost:8001` (default) |
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
-| `SERVER_WALLET` | EVM address that receives x402 payments |
+| `SERVER_WALLET` | BitGo treasury address (escrow wallet that receives x402 payments) |
 | `X402_FACILITATOR_URL` | `https://x402.org/facilitator` (free) |
 | `ELSA_PAYMENT_PRIVATE_KEY` | Private key for HeyElsa API payments |
 | `BITGO_ACCESS_TOKEN` | BitGo testnet access token |
+| `BITGO_WALLET_ID` | BitGo escrow wallet ID |
+| `BITGO_TREASURY_ADDRESS` | BitGo wallet receive address (same as `SERVER_WALLET`) |
+| `BITGO_WALLET_PASSPHRASE` | Passphrase for BitGo MPC signing |
+| `BITGO_ENTERPRISE_ID` | BitGo enterprise ID |
+| `BITGO_COIN` | `hteth` (Hoodi testnet ETH) |
 | `WEBHOOK_BASE_URL` | Your ngrok public URL |
 | `PORT` | `3001` (default) |
 
