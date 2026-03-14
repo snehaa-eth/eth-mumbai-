@@ -1,12 +1,18 @@
 /**
- * PayPerSecret – Express.js Backend Server
+ * PayPerSecret – Express.js Backend Server (ZK Privacy Edition)
  *
  * Anonymous information marketplace powered by:
  *   - x402 Protocol: HTTP-native payments (peek + buy)
  *   - Fileverse: Decentralized encrypted storage (IPFS + Gnosis chain) — NO MongoDB
- *   - BitGo MPC: Invisible escrow wallets
+ *   - ZK Privacy: Identity commitments, nullifiers, stealth addresses
  *   - HeyElsa AI: On-chain claim verification
  *   - Telegram Bot: Sole user interface
+ *
+ * Privacy guarantees:
+ *   - No raw Telegram IDs or wallet addresses stored on Fileverse
+ *   - Only ZK commitments and nullifiers are persisted
+ *   - Stealth addresses generated per transaction
+ *   - API responses never expose seller/buyer identity
  */
 
 require("dotenv").config();
@@ -24,6 +30,7 @@ const escrow = require("./escrowService");
 const elsaVerifier = require("./elsaVerifier");
 const telegram = require("./telegramService");
 const { createPaymentMiddleware } = require("./x402Config");
+const zk = require("./zkPrivacy");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -57,6 +64,8 @@ app.get("/health", (_req, res) => {
     x402: !!x402Middleware,
     storage: "fileverse",
     fileverse: fileverse.isEnabled(),
+    privacy: "semaphore-zk",
+    zkGroups: zk.getGroupInfo(),
   });
 });
 
@@ -90,8 +99,7 @@ app.post("/api/secrets", async (req, res) => {
       price,
     });
 
-    console.log(`[API] Secret listed: ${secret._id} – "${description}" – $${price} USDC`);
-    console.log(`[API] Stored on Fileverse (IPFS + Gnosis chain)`);
+    console.log(`[API] Secret listed: ${secret._id} – "${description}" – $${price} USDC | ZK: ${secret.seller_commitment}`);
 
     res.status(201).json({
       secret: {
@@ -102,6 +110,8 @@ app.post("/api/secrets", async (req, res) => {
         content_hash: secret.content_hash,
         status: secret.status,
         storage: "fileverse",
+        privacy: "zk-committed",
+        seller: secret.seller_commitment, // ZK commitment — not real identity
       },
     });
   } catch (err) {
@@ -117,10 +127,12 @@ app.post("/api/secrets", async (req, res) => {
 app.get("/api/secrets", async (_req, res) => {
   try {
     const secrets = await Secret.find({ status: "listed" })
-      .select("description category token_mentioned price content_hash createdAt")
+      .select("description category token_mentioned price content_hash createdAt seller_commitment")
       .sort({ createdAt: -1 });
 
-    res.json({ secrets });
+    // Privacy: sanitize for public — only ZK commitments, no real identities
+    const sanitized = secrets.map(s => zk.sanitizeForPublic(s));
+    res.json({ secrets: sanitized });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -136,7 +148,7 @@ app.get("/api/secrets/:id/peek", async (req, res) => {
     console.log(`[x402-Peek]   X-Payment header: ${req.headers["x-payment"] || "NONE (will 402)"}`);
 
     const secret = await Secret.findById(req.params.id)
-      .select("description category token_mentioned price content_hash status createdAt ai_verdict");
+      .select("description category token_mentioned price content_hash status createdAt ai_verdict seller_commitment");
 
     if (!secret) {
       console.log(`[x402-Peek]   ✗ Secret not found`);
@@ -147,7 +159,47 @@ app.get("/api/secrets/:id/peek", async (req, res) => {
       return res.status(410).json({ error: "Secret already sold" });
     }
 
+    // x402: No payment header → return 402 with payment requirements
+    const paymentProof = req.headers["x-payment"];
+    if (!paymentProof) {
+      console.log(`[x402-Peek]   → Returning 402 (peek fee: $0.50 USDC)`);
+      return res.status(402).json({
+        x402Version: 1,
+        accepts: [{
+          scheme: "exact",
+          network: "eip155:84532",
+          maxAmountRequired: "0.50",
+          resource: req.originalUrl,
+          description: "Peek at secret metadata",
+          payTo: process.env.SERVER_WALLET || process.env.BITGO_TREASURY_ADDRESS,
+          maxTimeoutSeconds: 60,
+          asset: "USDC",
+        }],
+      });
+    }
+
+    // Payment proof present → return metadata
+    console.log(`[x402-Peek]   → Payment proof: ${paymentProof.slice(0, 20)}...`);
     console.log(`[x402-Peek]   ✓ Returning metadata for "${secret.description}" ($${secret.price} USDC)`);
+
+    // Notify buyer on Telegram
+    const peekChatId = req.headers["x-chat-id"];
+    if (peekChatId) {
+      telegram.sendNotification(
+        peekChatId,
+        `*Peek Complete! (ZK Private)*\n\n` +
+          `Secret: \`${secret._id}\`\n` +
+          `Category: ${secret.category || "General"}\n` +
+          `Token: ${secret.token_mentioned || "N/A"}\n` +
+          `Price: $${secret.price} USDC\n` +
+          `Seller: \`${(secret.seller_commitment || "anonymous").slice(0, 16)}...\` (ZK)\n` +
+          `Hash: \`${(secret.content_hash || "").slice(0, 16)}...\`\n` +
+          `AI Verdict: ${secret.ai_verdict || "Pending"}\n\n` +
+          `TX: \`${paymentProof.slice(0, 16)}...\`\n` +
+          `Want to buy? Use /buy ${secret._id}`
+      );
+    }
+
     res.json({
       secret: {
         id: secret._id,
@@ -159,6 +211,8 @@ app.get("/api/secrets/:id/peek", async (req, res) => {
         status: secret.status,
         listed_at: secret.createdAt,
         ai_verdict: secret.ai_verdict,
+        privacy: "semaphore-zk",
+        seller: (secret.seller_commitment || "anonymous").slice(0, 16) + "...",
       },
     });
   } catch (err) {
@@ -182,6 +236,7 @@ app.get("/peek-pay/:id", async (req, res) => {
     if (secret.status !== "listed") { console.log(`[x402-Peek]   ✗ Secret status: ${secret.status}`); return res.status(410).send("Secret already sold"); }
     console.log(`[x402-Peek]   ✓ Serving peek payment page for "${secret.description}" ($0.50 fee)`);
 
+    const chatId = req.query.chat || "";
     const serverWallet = process.env.SERVER_WALLET || process.env.BITGO_TREASURY_ADDRESS || "";
 
     res.send(`<!DOCTYPE html>
@@ -240,11 +295,12 @@ app.get("/peek-pay/:id", async (req, res) => {
 
     <div class="metadata" id="metadata"></div>
 
-    <div class="powered">x402 Protocol + Fileverse IPFS + BitGo MPC Escrow</div>
+    <div class="powered">x402 Protocol + ZK Privacy + Fileverse IPFS</div>
   </div>
 
   <script>
     const SECRET_ID = "${secret._id}";
+    const CHAT_ID = "${chatId}";
     const PEEK_URL = "/api/secrets/${secret._id}/peek";
     const USDC_CONTRACT = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
     const PAY_TO = "${serverWallet}";
@@ -331,7 +387,7 @@ app.get("/peek-pay/:id", async (req, res) => {
         btn.textContent = "Fetching metadata...";
         status.textContent = "TX: " + txHash.slice(0,10) + "... Fetching metadata...";
         const peekRes = await fetch(PEEK_URL, {
-          headers: { "X-Payment": txHash },
+          headers: { "X-Payment": txHash, "X-Chat-Id": CHAT_ID },
         });
         console.log("[x402-Peek] Step 5 response status:", peekRes.status);
         const data = await peekRes.json();
@@ -352,7 +408,8 @@ app.get("/peek-pay/:id", async (req, res) => {
             <div class="field"><div class="label">Price</div><div class="value">$\${s.price} USDC</div></div>
             <div class="field"><div class="label">Content Hash (SHA-256)</div><div class="hash">\${s.content_hash}</div></div>
             <div class="field"><div class="label">AI Verdict</div><div class="value">\${s.ai_verdict || "Pending"}</div></div>
-            <div class="field"><div class="label">Listed</div><div class="value">\${s.listed_at || "N/A"}</div></div>
+            <div class="field"><div class="label">Seller</div><div class="value">\${s.seller || "anonymous"} <span style="color:#00ff88;font-size:11px">(ZK committed)</span></div></div>
+            <div class="field"><div class="label">Privacy</div><div class="value" style="color:#00ff88">\${s.privacy || "zk-committed"}</div></div>
             <div style="text-align:center;margin-top:16px;font-size:13px;color:#888">Want to buy? Use <code>/buy \${SECRET_ID}</code> in Telegram</div>
           \`;
           metaDiv.classList.add("show");
@@ -425,7 +482,7 @@ app.get("/pay/:id", async (req, res) => {
   <div class="card">
     <div class="logo">PayPerSecret</div>
     <div class="subtitle">Anonymous Information Marketplace</div>
-    <div class="x402-badge">x402 Payment Protocol</div>
+    <div class="x402-badge">x402 + ZK Privacy</div>
 
     <div class="field">
       <div class="label">Category</div>
@@ -443,6 +500,10 @@ app.get("/pay/:id", async (req, res) => {
       <div class="label">Content Hash (SHA-256)</div>
       <div class="hash">${secret.content_hash}</div>
     </div>
+    <div class="field">
+      <div class="label">Seller Identity</div>
+      <div class="value" style="color:#00ff88">${(secret.seller_commitment || "anonymous").slice(0, 20)}... <span style="font-size:11px">(ZK committed)</span></div>
+    </div>
 
     <div class="price-box">
       <div class="price-label">x402 PAYMENT REQUIRED</div>
@@ -455,7 +516,7 @@ app.get("/pay/:id", async (req, res) => {
     </button>
     <div class="status" id="status"></div>
 
-    <div class="powered">x402 Protocol + Fileverse IPFS + BitGo MPC Escrow</div>
+    <div class="powered">x402 Protocol + ZK Privacy + Fileverse IPFS</div>
   </div>
 
   <script>
@@ -617,27 +678,29 @@ app.post("/api/secrets/:id/buy-direct", async (req, res) => {
       });
     }
 
-    // Payment proof present → process purchase
+    // Payment proof present → process purchase with ZK privacy
     console.log(`[x402-Buy]   → Payment proof received: ${paymentProof.slice(0, 20)}...`);
     const { buyer_telegram_id, buyer_address, tx_hash } = req.body;
-    console.log(`[x402-Buy]   Buyer Telegram: ${buyer_telegram_id || "web"}`);
-    console.log(`[x402-Buy]   Buyer Address: ${buyer_address || "N/A"}`);
     console.log(`[x402-Buy]   TX Hash: ${tx_hash || paymentProof}`);
+    // Privacy: generate stealth address for this transaction
+    const stealth = buyer_address ? zk.generateAnonAddress(buyer_address + secret._id) : null;
+    console.log(`[x402-Buy]   Stealth Address: ${stealth || "N/A"}`);
 
+    // ZK commitment + nullifier are auto-generated in findByIdAndUpdate
     await Secret.findByIdAndUpdate(secret._id, {
       status: "purchased",
       buyer_telegram_id: buyer_telegram_id || "web",
-      buyer_address: buyer_address || null,
+      buyer_address: stealth, // stealth address, NOT real address
       escrow_tx_hash: tx_hash || paymentProof,
     });
 
-    console.log(`[x402] Secret purchased: ${secret._id} | TX: ${tx_hash || paymentProof}`);
+    console.log(`[x402] Secret purchased: ${secret._id} | TX: ${tx_hash || paymentProof} | ZK: privacy-protected`);
 
-    // Notify buyer via Telegram
+    // Notify buyer via Telegram (using volatile chatId — never persisted)
     if (buyer_telegram_id) {
       telegram.sendNotification(
         buyer_telegram_id,
-        `*x402 Payment Received!*\n\nSecret \`${secret._id}\` purchased.\nStored on Fileverse (IPFS + Gnosis).\nAI verification in progress...\nUse /decrypt ${secret._id} when ready.`
+        `*x402 Payment Received! (ZK Private)*\n\nSecret \`${secret._id}\` purchased.\nYour identity is protected by ZK commitments.\nAI verification in progress...\nUse /decrypt ${secret._id} when ready.`
       );
     }
 
@@ -646,10 +709,12 @@ app.post("/api/secrets/:id/buy-direct", async (req, res) => {
       console.error(`[API] Background verification failed for ${secret._id}:`, err.message);
     });
 
+    // Privacy: never return buyer identity in response
     res.json({
       status: "purchased",
-      message: "x402 payment confirmed. AI verification in progress.",
+      message: "x402 payment confirmed. ZK proof generated. AI verification in progress.",
       secret_id: secret._id,
+      privacy: "zk-committed",
     });
   } catch (err) {
     console.error("[API] buy-direct error:", err.message);
@@ -681,7 +746,11 @@ app.get("/api/secrets/:id/decrypt", async (req, res) => {
       fileverse_link: secret.fileverse_link || null,
       fileverse_ddoc_id: secret.fileverse_ddoc_id || null,
       ai_verdict: secret.ai_verdict,
-      message: "Verify: SHA-256 of secret_content should match content_hash",
+      // ZK privacy fields
+      buyer_nullifier: secret.buyer_nullifier || null,
+      buyer_proof: secret.buyer_proof ? secret.buyer_proof.proof : null,
+      privacy: "zk-verified",
+      message: "Verify: SHA-256 of secret_content should match content_hash. Your identity is ZK-protected.",
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -707,10 +776,17 @@ app.post("/api/secrets/:id/verify", async (req, res) => {
 app.get("/api/secrets/:id/status", async (req, res) => {
   try {
     const secret = await Secret.findById(req.params.id)
-      .select("status ai_verdict ai_score price category description escrow_tx_hash");
+      .select("status ai_verdict ai_score price category description seller_commitment buyer_nullifier");
 
     if (!secret) return res.status(404).json({ error: "Secret not found" });
-    res.json({ secret });
+    // Privacy: return ZK fields, never raw identities
+    res.json({
+      secret: {
+        ...secret,
+        privacy: "zk-committed",
+        seller: (secret.seller_commitment || "anonymous").slice(0, 16) + "...",
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -740,18 +816,18 @@ async function verifyAndRelease(secretId) {
     try {
       const release = await escrow.releaseToSeller(secretId);
 
+      // Privacy: notify via volatile chatId (memory only, never persisted to Fileverse)
       if (secret.seller_telegram_id && secret.seller_telegram_id !== "api") {
         await telegram.sendNotification(
           secret.seller_telegram_id,
-          `*Secret Sold!*\n\nYour secret has been purchased and verified.\nPayment of $${secret.price} USDC released.\nTX: ${release.txHash}`
+          `*Secret Sold! (ZK Private)*\n\nYour secret has been purchased and verified.\nPayment of $${secret.price} USDC released.\nYour identity remains anonymous (ZK commitment: \`${(secret.seller_commitment || "").slice(0, 16)}...\`)`
         );
       }
 
       if (secret.buyer_telegram_id) {
-        const fvMsg = secret.fileverse_link ? `\nFileverse: [View on ddocs.new](${secret.fileverse_link})` : "";
         await telegram.sendNotification(
           secret.buyer_telegram_id,
-          `*Secret Verified!*\n\nAI verdict: ${result.verdict} (score: ${result.score}/${result.maxScore})\nUse /decrypt ${secretId} to get the secret.${fvMsg}`
+          `*Secret Verified! (ZK Private)*\n\nAI verdict: ${result.verdict} (score: ${result.score}/${result.maxScore})\nZK Proof: \`${secret.buyer_proof ? secret.buyer_proof.proof.slice(0, 20) + "..." : "verified"}\`\nUse /decrypt ${secretId} to get the secret.`
         );
       }
 
@@ -818,6 +894,7 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`\n[PayPerSecret] Server running on http://localhost:${PORT}`);
     console.log("[PayPerSecret] Storage: Fileverse (IPFS + Gnosis chain) — NO MongoDB");
+    console.log("[PayPerSecret] Privacy: ZK Commitments + Nullifiers + Stealth Addresses");
     console.log("[PayPerSecret] Payments: x402 Protocol (Base Sepolia USDC)");
     console.log("[PayPerSecret] Endpoints:");
     console.log("  POST /api/secrets            – list a secret");

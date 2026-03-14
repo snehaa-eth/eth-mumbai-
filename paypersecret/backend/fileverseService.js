@@ -68,22 +68,10 @@ async function storeSecret(title, content, metadata = {}) {
   if (!enabled) return null;
 
   try {
-    const markdown = [
-      `# ${title}`,
-      "",
-      content,
-      "",
-      "---",
-      `**Category:** ${metadata.category || "General"}`,
-      metadata.token_mentioned ? `**Token:** ${metadata.token_mentioned}` : "",
-      `**Price:** $${metadata.price || "?"} USDC`,
-      `**Content Hash:** ${metadata.content_hash || "N/A"}`,
-      `**Stored:** ${new Date().toISOString()}`,
-    ].filter(Boolean).join("\n");
-
+    // Store pure JSON — no markdown wrapper (cleaner parsing on reload)
     const res = await axios.post(
       `${FILEVERSE_URL}/api/ddocs?apiKey=${API_KEY}`,
-      { title, content: markdown },
+      { title, content },
       { headers: { "Content-Type": "application/json" }, timeout: 15000 }
     );
 

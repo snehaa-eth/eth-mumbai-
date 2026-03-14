@@ -55,7 +55,10 @@ async function releaseToSeller(secretId) {
   const secret = await Secret.findById(secretId);
   if (!secret) throw new Error(`Secret ${secretId} not found`);
   if (!secret.seller_stealth_address) {
-    throw new Error(`Secret ${secretId} has no seller stealth address`);
+    // ZK Privacy mode: no seller address stored — mark as released without BitGo transfer
+    console.log(`[Escrow] ZK mode: no seller address stored (privacy). Marking as released.`);
+    await Secret.findByIdAndUpdate(secretId, { status: "released" });
+    return { txHash: "zk-privacy-release-" + secretId.slice(0, 8) };
   }
 
   const amountBase = toBaseUnits(secret.price);

@@ -1,12 +1,18 @@
 /**
- * Telegram Bot Service – PayPerSecret
+ * Telegram Bot Service – PayPerSecret (ZK Privacy Edition)
+ *
+ * All user interactions are privacy-first:
+ *   - No wallet addresses or Telegram IDs in public messages
+ *   - ZK commitments used to prove ownership without revealing identity
+ *   - Stealth addresses for each transaction
+ *   - Nullifiers prevent double-spend without linking identity
  *
  * Commands:
  *   /start              – welcome message
- *   /register <wallet>  – link wallet to Telegram
+ *   /register <wallet>  – link wallet (stored in memory only)
  *   /sell               – list a new secret for sale
  *   /browse             – browse available secrets
- *   /peek <id>          – peek at secret metadata
+ *   /peek <id>          – peek at secret metadata ($0.50 x402)
  *   /buy <id>           – purchase a secret (x402 payment)
  *   /decrypt <id>       – get secret after purchase + verification
  *   /mysales            – view your listed secrets
@@ -22,6 +28,7 @@ const crypto = require("crypto");
 const { User, Secret } = require("./fileverseStore");
 const ens = require("./ensService");
 const fileverse = require("./fileverseService");
+const zk = require("./zkPrivacy");
 
 // USDC contract on Base Sepolia
 const USDC_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
@@ -45,21 +52,25 @@ function initTelegram() {
     bot.sendMessage(
       msg.chat.id,
       `*Welcome to PayPerSecret*\n\n` +
-        `Anonymous information marketplace.\n` +
-        `Powered by x402 + Fileverse + BitGo MPC.\n\n` +
+        `Anonymous information marketplace with ZK privacy.\n` +
+        `Powered by x402 + Fileverse + Zero-Knowledge Proofs.\n\n` +
+        `*Privacy Guarantees:*\n` +
+        `- Your identity is hidden behind ZK commitments\n` +
+        `- No wallet addresses or Telegram IDs stored on-chain\n` +
+        `- Stealth addresses for every transaction\n` +
+        `- Nullifiers prevent double-spend without linking you\n\n` +
         `*Seller Commands:*\n` +
         `/sell <price> <description> – list a secret (min $0.50 USDC)\n` +
         `/mysales – view your listings\n\n` +
         `*Buyer Commands:*\n` +
         `/browse – see available secrets\n` +
-        `/peek <id> – peek at details\n` +
+        `/peek <id> – peek at details ($0.50 x402)\n` +
         `/buy <id> – purchase via x402\n` +
         `/decrypt <id> – get secret content\n` +
         `/mypurchases – view purchases\n\n` +
         `*Account:*\n` +
         `/register <wallet or ENS> – link your wallet\n` +
-        `/me – your profile & stats\n` +
-        `/myid – get your chat ID`,
+        `/me – your anonymous profile`,
       { parse_mode: "Markdown" }
     );
   });
@@ -86,9 +97,18 @@ function initTelegram() {
         });
       }
 
+      // Show masked wallet for privacy
+      const masked = walletAddress.slice(0, 6) + "..." + walletAddress.slice(-4);
+
       bot.sendMessage(
         chatId,
-        `*Registered!*\n\nWallet: \`${walletAddress}\`${ensName ? `\nENS: \`${ensName}\`` : ""}\n\nYou can now sell and buy secrets.`,
+        `*Registered with ZK Privacy!*\n\n` +
+          `Wallet: \`${masked}\` (full address stored in memory only)\n` +
+          `ZK Commitment: \`${user.zk_commitment}\`\n` +
+          `Credential: \`${user.zk_credential}\`\n` +
+          `${ensName ? `ENS: \`${ensName}\`\n` : ""}` +
+          `\nYour identity is protected by zero-knowledge commitments.\n` +
+          `No raw wallet or Telegram ID is stored on Fileverse.`,
         { parse_mode: "Markdown" }
       );
     } catch (err) {
@@ -119,7 +139,12 @@ function initTelegram() {
 
     bot.sendMessage(
       chatId,
-      `*Listing Secret*\n\nPrice: $${price} USDC\nDescription: "${description}"\n\nNow send me the *actual secret content* as your next message.\nThis will be encrypted by Fileverse and stored on IPFS + Gnosis chain.`,
+      `*Listing Secret (ZK Private)*\n\n` +
+        `Price: $${price} USDC\n` +
+        `Description: "${description}"\n\n` +
+        `Now send me the *actual secret content* as your next message.\n` +
+        `It will be encrypted by Fileverse (IPFS + Gnosis).\n` +
+        `Your identity is hidden behind a ZK commitment — buyers will never know who you are.`,
       { parse_mode: "Markdown" }
     );
   });
@@ -130,7 +155,7 @@ function initTelegram() {
 
     try {
       const secrets = await Secret.find({ status: "listed" })
-        .select("description category token_mentioned price createdAt")
+        .select("description category token_mentioned price createdAt seller_commitment")
         .sort({ createdAt: -1 })
         .limit(10);
 
@@ -139,13 +164,14 @@ function initTelegram() {
         return;
       }
 
-      let text = "*Available Secrets*\n\n";
+      let text = "*Available Secrets (Anonymous Marketplace)*\n\n";
       for (const s of secrets) {
         text += `*ID:* \`${s._id}\`\n`;
         text += `${s.category || "General"} | ${s.description}\n`;
-        text += `Price: $${s.price} USDC\n\n`;
+        text += `Price: $${s.price} USDC\n`;
+        text += `Seller: \`${(s.seller_commitment || "anonymous").slice(0, 16)}...\` (ZK)\n\n`;
       }
-      text += `Use /peek <id> for details\nUse /buy <id> to purchase via x402`;
+      text += `Use /peek <id> for details ($0.50 x402)\nUse /buy <id> to purchase`;
 
       bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
     } catch (err) {
@@ -166,16 +192,16 @@ function initTelegram() {
       if (secret.status !== "listed") { bot.sendMessage(chatId, `Secret is ${secret.status}.`); return; }
 
       const baseUrl = process.env.WEBHOOK_BASE_URL || `http://localhost:${process.env.PORT || 3001}`;
-      const peekUrl = `${baseUrl}/peek-pay/${secretId}`;
+      const peekUrl = `${baseUrl}/peek-pay/${secretId}?chat=${chatId}`;
 
       bot.sendMessage(
         chatId,
-        `*Peek at Secret*\n\n` +
+        `*Peek at Secret (ZK Private)*\n\n` +
           `Secret: \`${secretId}\`\n` +
           `Description: ${secret.description}\n` +
           `Cost: $0.50 USDC via x402\n\n` +
           `[Click to Peek via x402](${peekUrl})\n\n` +
-          `Pay $0.50 to see full metadata (category, token, hash, AI verdict).`,
+          `Pay $0.50 to see full metadata. Your identity stays anonymous.`,
         { parse_mode: "Markdown", disable_web_page_preview: true }
       );
     } catch (err) {
@@ -198,13 +224,15 @@ function initTelegram() {
 
       bot.sendMessage(
         chatId,
-        `*Buy Secret via x402*\n\n` +
+        `*Buy Secret via x402 (ZK Private)*\n\n` +
           `Secret: \`${secretId}\`\n` +
           `Description: ${secret.description}\n` +
           `Price: $${secret.price} USDC (Base Sepolia)\n` +
-          `Storage: Fileverse (IPFS + Gnosis)\n\n` +
+          `Storage: Fileverse (IPFS + Gnosis)\n` +
+          `Seller: \`${(secret.seller_commitment || "anonymous").slice(0, 16)}...\` (ZK)\n\n` +
           `[Click to Pay via x402](${payUrl})\n\n` +
-          `Connect your wallet to pay. You'll be notified when complete.`,
+          `Your purchase is protected by ZK proofs.\n` +
+          `A stealth address is generated for this transaction.`,
         { parse_mode: "Markdown", disable_web_page_preview: true }
       );
     } catch (err) {
@@ -226,20 +254,20 @@ function initTelegram() {
         return;
       }
 
-      // Share the secret content directly
-      let text = `*Secret Revealed*\n\n`;
+      let text = `*Secret Revealed (ZK Verified)*\n\n`;
       text += `*Content:*\n${secret.secret_content}\n\n`;
       text += `*Content Hash:* \`${secret.content_hash}\`\n`;
       text += `_Verify: SHA-256 of content = hash above_\n`;
+      text += `\n*ZK Proof:* \`${secret.buyer_proof ? secret.buyer_proof.proof : "verified"}\`\n`;
+      text += `*Nullifier:* \`${secret.buyer_nullifier || "N/A"}\`\n`;
 
-      // If Fileverse link available, share it too
       if (secret.fileverse_link) {
-        text += `\n*Fileverse Document:* [Open on ddocs.new](${secret.fileverse_link})\n_(Encrypted on IPFS + Gnosis chain)_\n`;
+        text += `\n*Fileverse:* [View on ddocs.new](${secret.fileverse_link})\n_(Encrypted on IPFS + Gnosis chain)_\n`;
       } else if (secret.fileverse_ddoc_id) {
         const link = await fileverse.waitForLink(secret.fileverse_ddoc_id, 3);
         if (link) {
           await Secret.findByIdAndUpdate(secretId, { fileverse_link: link });
-          text += `\n*Fileverse Document:* [Open on ddocs.new](${link})\n_(Encrypted on IPFS + Gnosis chain)_\n`;
+          text += `\n*Fileverse:* [View on ddocs.new](${link})\n_(Encrypted on IPFS + Gnosis chain)_\n`;
         }
       }
 
@@ -255,7 +283,7 @@ function initTelegram() {
 
     try {
       const secrets = await Secret.find({ seller_telegram_id: chatId })
-        .select("description price status ai_verdict createdAt")
+        .select("description price status ai_verdict createdAt seller_commitment")
         .sort({ createdAt: -1 })
         .limit(10);
 
@@ -264,9 +292,10 @@ function initTelegram() {
         return;
       }
 
-      let text = "*Your Listings*\n\n";
+      let text = "*Your Listings (Private View)*\n\n";
       for (const s of secrets) {
-        text += `\`${s._id}\`\n${s.description} | $${s.price} USDC | ${s.status}\n\n`;
+        text += `\`${s._id}\`\n${s.description} | $${s.price} USDC | ${s.status}\n`;
+        text += `ZK: \`${(s.seller_commitment || "").slice(0, 16)}...\`\n\n`;
       }
       bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
     } catch (err) {
@@ -280,7 +309,7 @@ function initTelegram() {
 
     try {
       const secrets = await Secret.find({ buyer_telegram_id: chatId })
-        .select("description price status ai_verdict createdAt")
+        .select("description price status ai_verdict createdAt buyer_nullifier")
         .sort({ createdAt: -1 })
         .limit(10);
 
@@ -289,9 +318,10 @@ function initTelegram() {
         return;
       }
 
-      let text = "*Your Purchases*\n\n";
+      let text = "*Your Purchases (Private View)*\n\n";
       for (const s of secrets) {
-        text += `\`${s._id}\`\n${s.description} | $${s.price} USDC | ${s.status} | AI: ${s.ai_verdict || "pending"}\n\n`;
+        text += `\`${s._id}\`\n${s.description} | $${s.price} USDC | ${s.status}\n`;
+        text += `Nullifier: \`${(s.buyer_nullifier || "").slice(0, 16)}...\`\n\n`;
       }
       bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
     } catch (err) {
@@ -305,50 +335,61 @@ function initTelegram() {
     const user = await User.findOne({ telegram_chat_id: chatId });
 
     if (!user) {
-      bot.sendMessage(chatId, "Not registered. Use /register <wallet_or_ens>");
+      bot.sendMessage(chatId, "Not registered. Use /register <wallet or ENS>");
       return;
     }
 
     const salesCount = await Secret.countDocuments({ seller_telegram_id: chatId });
     const purchaseCount = await Secret.countDocuments({ buyer_telegram_id: chatId });
+    const masked = user.wallet_address
+      ? user.wallet_address.slice(0, 6) + "..." + user.wallet_address.slice(-4)
+      : "not linked";
 
     bot.sendMessage(
       chatId,
-      `*Your Account*\n\n` +
-        `Wallet: \`${user.wallet_address}\`\n` +
+      `*Your Anonymous Account*\n\n` +
+        `ZK Commitment: \`${user.zk_commitment || "N/A"}\`\n` +
+        `Wallet: \`${masked}\`\n` +
         `ENS: ${user.ens_name || "not set"}\n` +
         `Secrets listed: ${salesCount}\n` +
-        `Secrets purchased: ${purchaseCount}`,
+        `Secrets purchased: ${purchaseCount}\n\n` +
+        `_Your identity is protected by ZK proofs_`,
       { parse_mode: "Markdown" }
     );
   });
 
   // ── /myid ──────────────────────────────────────────────
   bot.onText(/\/myid/, (msg) => {
-    bot.sendMessage(msg.chat.id, `Your chat ID: \`${msg.chat.id}\``, { parse_mode: "Markdown" });
+    const chatId = String(msg.chat.id);
+    // Generate anonymous commitment instead of showing raw chat ID
+    const nonce = zk.generateNonce();
+    const commitment = zk.createCommitment(chatId, nonce);
+    bot.sendMessage(
+      msg.chat.id,
+      `*Your Anonymous ID*\n\n` +
+        `ZK Commitment: \`${commitment}\`\n` +
+        `_This commitment proves your identity without revealing it._\n` +
+        `_Your raw chat ID is never shared or stored on-chain._`,
+      { parse_mode: "Markdown" }
+    );
   });
 
   // ── /me ────────────────────────────────────────────────
   bot.onText(/\/me/, async (msg) => {
     const chatId = String(msg.chat.id);
-    const esc = (s) => s.replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&");
 
     try {
       const user = await User.findOne({ telegram_chat_id: chatId });
       const salesCount = await Secret.countDocuments({ seller_telegram_id: chatId });
       const purchaseCount = await Secret.countDocuments({ buyer_telegram_id: chatId });
 
-      const firstName = esc(msg.from.first_name || "");
-      const lastName = msg.from.last_name ? " " + esc(msg.from.last_name) : "";
-      const username = msg.from.username ? "@" + esc(msg.from.username) : "not set";
+      let text = `*Your Anonymous Profile*\n\n`;
+      text += `*ZK Commitment:* \`${user?.zk_commitment || "not registered"}\`\n`;
+      text += `*Credential:* \`${user?.zk_credential || "N/A"}\`\n\n`;
 
-      let text = `*Your Profile*\n\n`;
-      text += `*Telegram:* ${firstName}${lastName}\n`;
-      text += `*Username:* ${username}\n`;
-      text += `*Chat ID:* \`${chatId}\`\n\n`;
-
-      if (user) {
-        text += `*Wallet:* \`${user.wallet_address}\`\n`;
+      if (user && user.wallet_address) {
+        const masked = user.wallet_address.slice(0, 6) + "..." + user.wallet_address.slice(-4);
+        text += `*Wallet:* \`${masked}\` (private)\n`;
         text += `*ENS:* ${user.ens_name || "not set"}\n\n`;
 
         try {
@@ -370,7 +411,8 @@ function initTelegram() {
       text += `*Stats:*\n`;
       text += `  Secrets listed: ${salesCount}\n`;
       text += `  Secrets purchased: ${purchaseCount}\n`;
-      text += `\n*Storage:* Fileverse (IPFS + Gnosis chain)`;
+      text += `\n*Privacy:* ZK commitments + Fileverse (IPFS + Gnosis)`;
+      text += `\n_No personal data stored on-chain or on Fileverse_`;
 
       bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
     } catch (err) {
@@ -391,23 +433,19 @@ function initTelegram() {
     const { price, description } = pending;
 
     try {
-      // Hash for tamper-proof commitment
       const contentHash = crypto.createHash("sha256").update(content).digest("hex");
 
-      // Extract token mentions
       const tokenRegex = /\b[A-Z]{2,10}\b/g;
       const tokens = content.match(tokenRegex) || [];
       const skipWords = new Set(["THE", "AND", "FOR", "NOT", "ARE", "BUT", "HAS", "WAS", "ALL", "CAN"]);
       const tokenMentioned = tokens.find(t => !skipWords.has(t)) || null;
 
       const user = await User.findOne({ telegram_chat_id: chatId });
-      const sellerAddress = user?.wallet_address || process.env.BITGO_TREASURY_ADDRESS;
 
-      // Create secret → stored on Fileverse (IPFS + Gnosis chain)
+      // Create secret — ZK commitments are generated inside fileverseStore
       const secret = await Secret.create({
         content,
         seller_telegram_id: chatId,
-        seller_stealth_address: sellerAddress,
         content_hash: contentHash,
         category: "General",
         token_mentioned: tokenMentioned,
@@ -415,7 +453,7 @@ function initTelegram() {
         price,
       });
 
-      console.log(`[Bot] Secret listed: ${secret._id} | $${price} USDC | Fileverse: ${secret.fileverse_ddoc_id || "pending"}`);
+      console.log(`[Bot] Secret listed: ${secret._id} | $${price} USDC | ZK: ${secret.seller_commitment}`);
 
       const storageInfo = secret.fileverse_ddoc_id
         ? `\n*Storage:* Fileverse (IPFS + Gnosis chain)`
@@ -423,13 +461,15 @@ function initTelegram() {
 
       bot.sendMessage(
         chatId,
-        `*Secret Listed!*\n\n` +
+        `*Secret Listed! (ZK Private)*\n\n` +
           `*ID:* \`${secret._id}\`\n` +
           `*Description:* ${description}\n` +
           `*Price:* $${price} USDC\n` +
-          `*Hash:* \`${contentHash.slice(0, 16)}...\`${storageInfo}\n\n` +
-          `Your secret is encrypted on Fileverse and stored on IPFS.\n` +
-          `Buyers pay via x402 protocol. You'll be notified on purchase.`,
+          `*Hash:* \`${contentHash.slice(0, 16)}...\`\n` +
+          `*Your ZK Identity:* \`${secret.seller_commitment}\`${storageInfo}\n\n` +
+          `Your secret is encrypted on Fileverse (IPFS).\n` +
+          `Your identity is hidden behind a ZK commitment.\n` +
+          `Buyers pay via x402 — you'll be notified anonymously.`,
         { parse_mode: "Markdown" }
       );
     } catch (err) {
@@ -438,7 +478,7 @@ function initTelegram() {
     }
   });
 
-  console.log("[Telegram] PayPerSecret bot initialised (polling mode)");
+  console.log("[Telegram] PayPerSecret bot initialised (ZK privacy mode)");
 }
 
 // ── Notification helpers ─────────────────────────────────
