@@ -78,7 +78,7 @@ Express.js Server (port 3001)
 ## Project Structure
 
 ```
-ghostpay/
+paypersecret/
   backend/
     server.js              # Express API + payment pages (x402)
     telegramService.js     # Telegram bot commands
@@ -104,7 +104,7 @@ ghostpay/
 ### 1. Clone and install
 
 ```bash
-cd ghostpay/backend
+cd paypersecret/backend
 npm install
 ```
 
@@ -168,7 +168,7 @@ npx @fileverse/api --apiKey YOUR_FILEVERSE_KEY --rpcUrl https://rpc.ankr.com/gno
 ngrok http 3001
 
 # Terminal 3 – PayPerSecret server
-cd ghostpay/backend
+cd paypersecret/backend
 node server.js
 ```
 

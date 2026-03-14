@@ -1,7 +1,7 @@
 {
-  "name": "ghostpay-backend",
+  "name": "paypersecret",
   "version": "1.0.0",
-  "description": "Privacy-preserving payroll and bounty distribution system",
+  "description": "Anonymous information marketplace – x402 + Fileverse + BitGo MPC",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
